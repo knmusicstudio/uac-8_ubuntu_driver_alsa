@@ -1,5 +1,9 @@
 # snd-uac8 (Experimental)
 
+## ⚠️ Looking for Maintainers / Help Upstreaming
+I made this driver work on ALSA for ZOOM UAC-8, but I don't have the time to maintain it against future kernel updates or send it to upstream alsa-devel.
+If anyone wants to take over, submit patches to the kernel, or co-maintain, feel free to fork or reach out!
+
 Experimental ALSA Linux kernel driver for the **ZOOM UAC-8** USB 3.0 audio interface (USB ID `1686:f02b`).
 
 ## Prerequisites
