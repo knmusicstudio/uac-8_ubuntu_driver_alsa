@@ -178,19 +178,29 @@ static int uac8_rate_to_alt(unsigned int rate)
 	return 3;
 }
 
-/* 戻り値は無視してよい (元コードも無視していた) 制御転送。DMA 安全なコピーを使う */
+/*
+ * 戻り値は無視してよい (元コードも無視していた) 制御転送。
+ * xHCI 等の DMA バッファ要件および len == 0 での NULL 参照回避のため、
+ * 常に kmalloc 経由の DMA-safe なバッファを渡す。
+ */
 static int uac8_ctrl_out(struct uac8 *chip, u8 reqtype, u8 req, u16 value,
 			 u16 index, const void *data, u16 len)
 {
 	struct usb_device *udev = chip->udev;
-	void *buf = NULL;
+	void *buf;
 	int ret;
 
 	if (len) {
 		buf = kmemdup(data, len, GFP_KERNEL);
 		if (!buf)
 			return -ENOMEM;
+	} else {
+		/* len == 0 でもコントローラ層での安全性のためにダミーバッファを確保 */
+		buf = kmalloc(1, GFP_KERNEL);
+		if (!buf)
+			return -ENOMEM;
 	}
+
 	ret = usb_control_msg(udev, usb_sndctrlpipe(udev, 0), req, reqtype,
 			      value, index, buf, len, UAC8_CTRL_TIMEOUT_MS);
 	kfree(buf);
@@ -285,7 +295,7 @@ static bool uac8_stream_active(const struct uac8_stream *s)
 	rt = s->substream->runtime;
 	if (!rt || !rt->dma_area)
 		return false;
-	if (!s->ch || s->ch * UAC8_SAMPLE_BYTES > UAC8_FRAME_BYTES)
+	if (!s->ch || s->ch > s->max_ch || s->ch * UAC8_SAMPLE_BYTES > UAC8_FRAME_BYTES)
 		return false;
 	if (!s->buffer_size || !s->period_size)
 		return false;
@@ -308,11 +318,16 @@ static inline bool uac8_advance(struct uac8_stream *s)
 	return elapsed;
 }
 
-/* PCM -> URB バッファ (32ch フレームの先頭 ch 分を埋め、残りは無音) */
+/*
+ * PCM -> URB バッファ
+ * アプリケーション指定のチャンネル数 (s->ch) 分を先頭から順に詰め、
+ * ハードウェアの 32ch (128 バイト) に満たない残余チャンネル領域は完全にゼロ埋めする。
+ */
 static bool uac8_fill_playback(struct uac8_stream *s, u8 *buf)
 {
 	const struct snd_pcm_runtime *rt = s->substream->runtime;
 	const unsigned int cb = s->ch * UAC8_SAMPLE_BYTES;
+	const unsigned int pad = UAC8_FRAME_BYTES - cb;
 	bool elapsed = false;
 	unsigned int i;
 
@@ -320,14 +335,19 @@ static bool uac8_fill_playback(struct uac8_stream *s, u8 *buf)
 		u8 *dst = buf + i * UAC8_FRAME_BYTES;
 
 		memcpy(dst, rt->dma_area + (size_t)s->hwptr * cb, cb);
-		memset(dst + cb, 0, UAC8_FRAME_BYTES - cb);
+		if (pad)
+			memset(dst + cb, 0, pad);
 		if (uac8_advance(s))
 			elapsed = true;
 	}
 	return elapsed;
 }
 
-/* URB バッファ -> PCM (32ch フレームの先頭 ch 分だけ取る) */
+/*
+ * URB バッファ -> PCM
+ * ハードウェアから受信した 32ch インターリーブデータのうち、
+ * アプリケーション指定の先頭 s->ch チャンネル分のみを PCM 領域に転送する。
+ */
 static bool uac8_drain_capture(struct uac8_stream *s, const u8 *buf,
 			       unsigned int frames)
 {
