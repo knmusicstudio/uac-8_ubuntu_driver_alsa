@@ -2,28 +2,7 @@
 /*
  * snd-uac8 - ALSA USB オーディオドライバ (ZOOM UAC-8, USB 1686:f02b)
  *
- * libusb + JACK + GTK で書かれていたユーザ空間ブリッジ (main.c) を、
- * カーネル内の ALSA ドライバとして書き直したもの。
- *
- *   元の main.c                               このドライバ
- *   ------------------------------------  ---------------------------------
- *   libusb bulk transfer x128 (IN/OUT)    bulk URB x128 (IN/OUT)
- *   リングバッファ + JACK process()       ALSA PCM バッファ (URB 完了で直接コピー)
- *   JACK capture 18ch / playback 20ch     PCM capture 1..18ch / playback 1..20ch
- *   configure_uac8_hardware()             uac8_configure_hw()
- *   サンプルレート→Alt 切替               uac8_rate_to_alt()
- *   Start/Stop ボタン                     PCM prepare / close
- *   GTK / jackd / a2jmidid                不要 (ALSA がそのまま見える)
- *
- * パニック対策の方針:
- *   - URB のライフサイクルは「全 URB を usb_kill_urb() で個別に殺してから解放」
- *     に統一 (完了ハンドラ実行中の解放を防ぐ)
- *   - 完了ハンドラ内では sleep しない / 自前ロックを持ったまま ALSA を呼ばない
- *   - ハンドラで触る PCM 状態は chip->lock で保護し、substream の close 後に
- *     触らないよう running/substream を同ロック下で落としてから待ち合わせる
- *   - エラー連発時は無限再投入せず、work で PCM を XRUN にして止める
- *   - 配列添字・除算・バッファ境界は全部ハンドラ内でも検証する
- *   - デバイス切断後は USB 通信を一切しない (disconnected / udev->state)
+ * 32, 64, 128, 256, 512, 1024, 2048 サンプル/周期 (frames/period) 完全対応版
  */
 
 #include <linux/module.h>
@@ -46,39 +25,37 @@ MODULE_DESCRIPTION("ALSA driver for ZOOM UAC-8 (1686:f02b)");
 MODULE_LICENSE("GPL");
 
 /* ------------------------------------------------------------------ */
-/* デバイス定数 (元の main.c の #define に対応)                         */
+/* デバイス定数                                                        */
 /* ------------------------------------------------------------------ */
 #define UAC8_VENDOR_ID		0x1686
 #define UAC8_PRODUCT_ID		0xf02b
 
-#define UAC8_IF_CTRL		0	/* AudioControl */
-#define UAC8_IF_OUT		1	/* AudioStreaming: host -> device */
-#define UAC8_IF_IN		2	/* AudioStreaming: device -> host */
+#define UAC8_IF_CTRL		0
+#define UAC8_IF_OUT		1
+#define UAC8_IF_IN		2
 
-#define UAC8_EP_OUT		0x01	/* EP_AUDIO_OUT */
-#define UAC8_EP_IN		0x82	/* EP_AUDIO_IN  */
+#define UAC8_EP_OUT		0x01
+#define UAC8_EP_IN		0x82
 
-#define UAC8_PHYS_CHANNELS	32	/* NUM_PHYS_CHANNELS */
+#define UAC8_PHYS_CHANNELS	32
 #define UAC8_SAMPLE_BYTES	4	/* S32_LE */
 #define UAC8_FRAME_BYTES	(UAC8_PHYS_CHANNELS * UAC8_SAMPLE_BYTES)	/* 128 */
 
-#define UAC8_URB_BYTES		1024	/* PACKET_SIZE */
+#define UAC8_URB_BYTES		1024
 #define UAC8_URB_FRAMES		(UAC8_URB_BYTES / UAC8_FRAME_BYTES)	/* 8 */
-#define UAC8_NUM_URBS		128	/* NUM_TRANSFERS (各方向) */
+#define UAC8_MAX_URBS		128
 
-#define UAC8_PLAY_CHANNELS	20	/* JACK_OUT_CHANNELS */
-#define UAC8_CAP_CHANNELS	18	/* JACK_IN_CHANNELS  */
+#define UAC8_PLAY_CHANNELS	20
+#define UAC8_CAP_CHANNELS	18
 
-#define UAC8_PERIOD_FRAMES_MIN	32
-#define UAC8_PERIOD_FRAMES_MAX	16384
 #define UAC8_BUFFER_FRAMES_MAX	32768
 #define UAC8_PERIODS_MIN	2
 #define UAC8_PERIODS_MAX	64
 
 #define UAC8_CTRL_TIMEOUT_MS	1000
-#define UAC8_MAX_ERRORS		32	/* 連続エラーがこの数に達したら諦める */
+#define UAC8_MAX_ERRORS		32
 
-#define UAC8_COMPANION		((void *)-1L)	/* claim しただけの IF の目印 */
+#define UAC8_COMPANION		((void *)-1L)
 
 static_assert(UAC8_URB_BYTES % UAC8_FRAME_BYTES == 0);
 static_assert(UAC8_PLAY_CHANNELS <= UAC8_PHYS_CHANNELS);
@@ -115,26 +92,27 @@ struct uac8_stream {
 	struct uac8 *chip;
 	bool playback;
 	unsigned int max_ch;
-	struct uac8_urb_ctx ctx[UAC8_NUM_URBS];
+	unsigned int active_urbs;	/* 周期サイズに応じて動的計算 */
+	struct uac8_urb_ctx ctx[UAC8_MAX_URBS];
 
-	/* ---- chip->lock で保護 (URB 完了ハンドラからも触る) ---- */
-	struct snd_pcm_substream *substream;	/* open 中のみ非 NULL */
-	bool running;				/* trigger START 済み */
-	unsigned int ch;			/* PCM のチャンネル数 */
-	unsigned int hwptr;			/* フレーム単位 */
+	/* chip->lock で保護 */
+	struct snd_pcm_substream *substream;
+	bool running;
+	unsigned int ch;
+	unsigned int hwptr;
 	unsigned int period_pos;
-	unsigned int buffer_size;		/* フレーム */
-	unsigned int period_size;		/* フレーム */
+	unsigned int buffer_size;
+	unsigned int period_size;
 
-	/* ---- chip->mutex で保護 ---- */
-	unsigned int hw_rate;			/* hw_params 済みレート (0=未設定) */
+	/* chip->mutex で保護 */
+	unsigned int hw_rate;
 
-	atomic_t notify_busy;			/* snd_pcm_period_elapsed 実行中の数 */
-	atomic_t errors;			/* 連続 URB エラー数 */
+	atomic_t notify_busy;
+	atomic_t errors;
 };
 
 enum {
-	UAC8_FLAG_FAILED,			/* ストリーミング継続不能 */
+	UAC8_FLAG_FAILED,
 };
 
 struct uac8 {
@@ -142,19 +120,18 @@ struct uac8 {
 	struct snd_card *card;
 	struct snd_pcm *pcm;
 
-	struct mutex mutex;			/* open/close/prepare/engine 制御 */
-	spinlock_t lock;			/* PCM 状態 (ハンドラと共有) */
+	struct mutex mutex;
+	spinlock_t lock;
 
-	struct uac8_stream stream[2];		/* [SNDRV_PCM_STREAM_*] */
+	struct uac8_stream stream[2];
 
-	/* mutex 保護 */
 	bool engine_running;
 	bool hw_configured;
 	unsigned int rate;
 
-	bool disconnected;			/* READ_ONCE/WRITE_ONCE */
-	bool stopping;				/* READ_ONCE/WRITE_ONCE */
-	unsigned long flags;			/* UAC8_FLAG_* (atomic bitops) */
+	bool disconnected;
+	bool stopping;
+	unsigned long flags;
 	struct work_struct fail_work;
 };
 
@@ -167,7 +144,7 @@ static inline struct uac8_stream *uac8_stream_of(struct uac8 *chip,
 }
 
 /* ------------------------------------------------------------------ */
-/* ハードウェア初期化 (元: configure_uac8_hardware)                    */
+/* ハードウェア制御                                                    */
 /* ------------------------------------------------------------------ */
 static int uac8_rate_to_alt(unsigned int rate)
 {
@@ -178,11 +155,6 @@ static int uac8_rate_to_alt(unsigned int rate)
 	return 3;
 }
 
-/*
- * 戻り値は無視してよい (元コードも無視していた) 制御転送。
- * xHCI 等の DMA バッファ要件および len == 0 での NULL 参照回避のため、
- * 常に kmalloc 経由の DMA-safe なバッファを渡す。
- */
 static int uac8_ctrl_out(struct uac8 *chip, u8 reqtype, u8 req, u16 value,
 			 u16 index, const void *data, u16 len)
 {
@@ -195,7 +167,6 @@ static int uac8_ctrl_out(struct uac8 *chip, u8 reqtype, u8 req, u16 value,
 		if (!buf)
 			return -ENOMEM;
 	} else {
-		/* len == 0 でもコントローラ層での安全性のためにダミーバッファを確保 */
 		buf = kmalloc(1, GFP_KERNEL);
 		if (!buf)
 			return -ENOMEM;
@@ -217,7 +188,6 @@ static bool uac8_dev_gone(struct uac8 *chip)
 	       chip->udev->state == USB_STATE_NOTATTACHED;
 }
 
-/* chip->mutex 保持・URB 未投入の状態で呼ぶこと */
 static int uac8_configure_hw(struct uac8 *chip, unsigned int rate, int alt)
 {
 	struct usb_device *udev = chip->udev;
@@ -228,7 +198,6 @@ static int uac8_configure_hw(struct uac8 *chip, unsigned int rate, int alt)
 
 	chip->hw_configured = true;
 
-	/* Alt 0 に落として落ち着かせる */
 	err = usb_set_interface(udev, UAC8_IF_OUT, 0);
 	if (err < 0)
 		goto err_if;
@@ -237,21 +206,15 @@ static int uac8_configure_hw(struct uac8 *chip, unsigned int rate, int alt)
 		goto err_if;
 	msleep(20);
 
-	/* クロックセレクタ / サンプリング周波数 (UAC2 class request) */
 	uac8_ctrl_out(chip, 0x21, 0x01, 0x0100, 0x2900, &clk_sel, 1);
 	uac8_ctrl_out(chip, 0x21, 0x01, 0x0100, 0x2500, &rate_le, 4);
 	uac8_ctrl_out(chip, 0x21, 0x01, 0x0100, 0x2800, &rate_le, 4);
 
-	/* ミュート解除 / ボリューム 0 (元コードのまま) */
 	uac8_ctrl_out(chip, 0x21, 0x01, 0x0100, 0x2900, zero2, 2);
 	uac8_ctrl_out(chip, 0x21, 0x01, 0x0200, 0x2900, zero2, 2);
 	uac8_ctrl_out(chip, 0x21, 0x01, 0x0201, 0x2900, zero2, 2);
 	uac8_ctrl_out(chip, 0x21, 0x01, 0x0202, 0x2900, zero2, 2);
 
-	/*
-	 * 生の SET_INTERFACE(0x0B) / CLEAR_FEATURE(HALT)(0x01) を元コードと
-	 * 同じ順序で送る。最後に usb_set_interface() でホスト側の状態を合わせる。
-	 */
 	uac8_ctrl_out(chip, 0x01, 0x0B, alt, UAC8_IF_OUT, NULL, 0);
 	uac8_ctrl_out(chip, 0x01, 0x0B, alt, UAC8_IF_IN, NULL, 0);
 	uac8_ctrl_out(chip, 0x02, 0x01, 0x0000, UAC8_EP_OUT, NULL, 0);
@@ -277,7 +240,7 @@ err_if:
 }
 
 /* ------------------------------------------------------------------ */
-/* URB 管理                                                            */
+/* URB / ストリーミング                                               */
 /* ------------------------------------------------------------------ */
 static void uac8_fail(struct uac8 *chip)
 {
@@ -285,7 +248,6 @@ static void uac8_fail(struct uac8 *chip)
 		schedule_work(&chip->fail_work);
 }
 
-/* chip->lock 保持中に呼ぶ。ハンドラが PCM バッファを安全に触れる状態か */
 static bool uac8_stream_active(const struct uac8_stream *s)
 {
 	const struct snd_pcm_runtime *rt;
@@ -304,7 +266,6 @@ static bool uac8_stream_active(const struct uac8_stream *s)
 	return true;
 }
 
-/* 1 フレーム進める。period 境界を跨いだら true */
 static inline bool uac8_advance(struct uac8_stream *s)
 {
 	bool elapsed = false;
@@ -318,11 +279,6 @@ static inline bool uac8_advance(struct uac8_stream *s)
 	return elapsed;
 }
 
-/*
- * PCM -> URB バッファ
- * アプリケーション指定のチャンネル数 (s->ch) 分を先頭から順に詰め、
- * ハードウェアの 32ch (128 バイト) に満たない残余チャンネル領域は完全にゼロ埋めする。
- */
 static bool uac8_fill_playback(struct uac8_stream *s, u8 *buf)
 {
 	const struct snd_pcm_runtime *rt = s->substream->runtime;
@@ -343,11 +299,6 @@ static bool uac8_fill_playback(struct uac8_stream *s, u8 *buf)
 	return elapsed;
 }
 
-/*
- * URB バッファ -> PCM
- * ハードウェアから受信した 32ch インターリーブデータのうち、
- * アプリケーション指定の先頭 s->ch チャンネル分のみを PCM 領域に転送する。
- */
 static bool uac8_drain_capture(struct uac8_stream *s, const u8 *buf,
 			       unsigned int frames)
 {
@@ -365,7 +316,6 @@ static bool uac8_drain_capture(struct uac8_stream *s, const u8 *buf,
 	return elapsed;
 }
 
-/* 再投入してよい URB か判定。無限エラーループ防止もここで行う */
 static bool uac8_urb_ok(struct uac8_stream *s, struct urb *urb)
 {
 	struct uac8 *chip = s->chip;
@@ -378,12 +328,12 @@ static bool uac8_urb_ok(struct uac8_stream *s, struct urb *urb)
 	case 0:
 		atomic_set(&s->errors, 0);
 		return true;
-	case -ESHUTDOWN:	/* 切断 / endpoint 無効化 */
+	case -ESHUTDOWN:
 	case -ENODEV:
 		return false;
-	case -ENOENT:		/* 想定外の unlink */
+	case -ENOENT:
 	case -ECONNRESET:
-	case -EPIPE:		/* STALL: process context での復旧が必要 */
+	case -EPIPE:
 		uac8_fail(chip);
 		return false;
 	default:
@@ -413,7 +363,6 @@ static void uac8_resubmit(struct uac8_stream *s, struct urb *urb)
 	}
 }
 
-/* OUT 完了: 次に送る 8 フレームを用意して再投入 (元: cb_out) */
 static void uac8_play_complete(struct urb *urb)
 {
 	struct uac8_urb_ctx *c = urb->context;
@@ -432,7 +381,6 @@ static void uac8_play_complete(struct urb *urb)
 			atomic_inc(&s->notify_busy);
 		}
 	} else {
-		/* PCM が動いていない間は無音を送り続ける (元: underrun 時 memset 0) */
 		memset(c->buf, 0, UAC8_URB_BYTES);
 	}
 	spin_unlock_irqrestore(&chip->lock, flags);
@@ -446,7 +394,6 @@ static void uac8_play_complete(struct urb *urb)
 	}
 }
 
-/* IN 完了: 受信フレームを PCM へ入れて再投入 (元: cb_in) */
 static void uac8_capture_complete(struct urb *urb)
 {
 	struct uac8_urb_ctx *c = urb->context;
@@ -489,7 +436,7 @@ static void uac8_free_stream(struct uac8_stream *s)
 	struct usb_device *udev = s->chip->udev;
 	int i;
 
-	for (i = 0; i < UAC8_NUM_URBS; i++) {
+	for (i = 0; i < UAC8_MAX_URBS; i++) {
 		struct uac8_urb_ctx *c = &s->ctx[i];
 
 		if (c->buf)
@@ -499,15 +446,17 @@ static void uac8_free_stream(struct uac8_stream *s)
 		c->buf = NULL;
 		c->urb = NULL;
 	}
+	s->active_urbs = 0;
 }
 
 static int uac8_alloc_stream(struct uac8_stream *s, unsigned int pipe,
-			     usb_complete_t complete)
+			     usb_complete_t complete, unsigned int num_urbs)
 {
 	struct usb_device *udev = s->chip->udev;
 	int i;
 
-	for (i = 0; i < UAC8_NUM_URBS; i++) {
+	s->active_urbs = num_urbs;
+	for (i = 0; i < num_urbs; i++) {
 		struct uac8_urb_ctx *c = &s->ctx[i];
 
 		c->stream = s;
@@ -526,15 +475,11 @@ static int uac8_alloc_stream(struct uac8_stream *s, unsigned int pipe,
 	return 0;
 }
 
-/*
- * 全 URB を個別に kill する。usb_kill_urb() は「その URB の完了ハンドラが
- * 戻るまで」待つので、これが終われば全ハンドラは確実に退出済み。
- */
 static void uac8_kill_stream(struct uac8_stream *s)
 {
 	int i;
 
-	for (i = 0; i < UAC8_NUM_URBS; i++)
+	for (i = 0; i < s->active_urbs; i++)
 		if (s->ctx[i].urb)
 			usb_kill_urb(s->ctx[i].urb);
 }
@@ -543,7 +488,7 @@ static int uac8_submit_stream(struct uac8_stream *s)
 {
 	int i, err;
 
-	for (i = 0; i < UAC8_NUM_URBS; i++) {
+	for (i = 0; i < s->active_urbs; i++) {
 		err = usb_submit_urb(s->ctx[i].urb, GFP_KERNEL);
 		if (err) {
 			dev_err(&s->chip->udev->dev,
@@ -561,7 +506,6 @@ static bool uac8_ep_is_bulk(struct usb_device *udev, unsigned int pipe)
 	return ep && usb_endpoint_xfer_bulk(&ep->desc);
 }
 
-/* chip->mutex 保持 */
 static void uac8_stop_engine(struct uac8 *chip)
 {
 	lockdep_assert_held(&chip->mutex);
@@ -583,23 +527,48 @@ static void uac8_stop_engine(struct uac8 *chip)
 }
 
 /*
- * 元の audio_worker_thread() の USB 部分に相当。
- * IN/OUT の bulk URB を常時回し続ける。PCM が動いていない間は
- * OUT=無音 / IN=捨てる、という動作 (元コードと同じ挙動)。
- * chip->mutex 保持。
+ * 周期サイズ (period_size) に応じて投入する URB 本数を動的に決定する。
+ * 1 URB = 8 フレーム。
+ * 例:
+ *   32  フレーム -> 8 URB  (64 フレーム分先行, ~0.67ms)
+ *   64  フレーム -> 16 URB (128 フレーム分先行)
+ *   128 フレーム -> 32 URB (256 フレーム分先行)
+ *   256 フレーム以上 -> 64〜128 URB
  */
-static int uac8_start_engine(struct uac8 *chip, unsigned int rate)
+static unsigned int uac8_calc_urbs(unsigned int period_size)
+{
+	unsigned int urbs;
+
+	if (period_size <= 32)
+		urbs = 8;
+	else if (period_size <= 64)
+		urbs = 16;
+	else if (period_size <= 128)
+		urbs = 32;
+	else if (period_size <= 512)
+		urbs = 64;
+	else
+		urbs = UAC8_MAX_URBS;
+
+	return clamp_val(urbs, 8U, (unsigned int)UAC8_MAX_URBS);
+}
+
+static int uac8_start_engine(struct uac8 *chip, unsigned int rate,
+			     unsigned int period_size)
 {
 	struct usb_device *udev = chip->udev;
 	struct uac8_stream *play = &chip->stream[SNDRV_PCM_STREAM_PLAYBACK];
 	struct uac8_stream *cap = &chip->stream[SNDRV_PCM_STREAM_CAPTURE];
 	unsigned int pipe_out, pipe_in;
+	unsigned int num_urbs;
 	int err;
 
 	lockdep_assert_held(&chip->mutex);
 
 	if (READ_ONCE(chip->disconnected))
 		return -ENODEV;
+
+	num_urbs = uac8_calc_urbs(period_size);
 
 	err = uac8_configure_hw(chip, rate, uac8_rate_to_alt(rate));
 	if (err)
@@ -614,10 +583,10 @@ static int uac8_start_engine(struct uac8 *chip, unsigned int rate)
 		goto err_stop;
 	}
 
-	err = uac8_alloc_stream(cap, pipe_in, uac8_capture_complete);
+	err = uac8_alloc_stream(cap, pipe_in, uac8_capture_complete, num_urbs);
 	if (err)
 		goto err_stop;
-	err = uac8_alloc_stream(play, pipe_out, uac8_play_complete);
+	err = uac8_alloc_stream(play, pipe_out, uac8_play_complete, num_urbs);
 	if (err)
 		goto err_stop;
 
@@ -627,7 +596,7 @@ static int uac8_start_engine(struct uac8 *chip, unsigned int rate)
 	chip->rate = rate;
 	WRITE_ONCE(chip->stopping, false);
 
-	err = uac8_submit_stream(cap);	/* 元コードも IN から投入 */
+	err = uac8_submit_stream(cap);
 	if (err)
 		goto err_stop;
 	err = uac8_submit_stream(play);
@@ -635,8 +604,8 @@ static int uac8_start_engine(struct uac8 *chip, unsigned int rate)
 		goto err_stop;
 
 	chip->engine_running = true;
-	dev_dbg(&udev->dev, "streaming started: %u Hz, alt %d\n",
-		rate, uac8_rate_to_alt(rate));
+	dev_info(&udev->dev, "streaming started: %u Hz, alt %d, queue %u URBs (%u frames ahead)\n",
+		 rate, uac8_rate_to_alt(rate), num_urbs, num_urbs * UAC8_URB_FRAMES);
 	return 0;
 
 err_stop:
@@ -644,7 +613,6 @@ err_stop:
 	return err;
 }
 
-/* 異常時に process context で PCM を XRUN にする。再 prepare でエンジン再起動 */
 static void uac8_fail_work(struct work_struct *work)
 {
 	struct uac8 *chip = container_of(work, struct uac8, fail_work);
@@ -656,7 +624,6 @@ static void uac8_fail_work(struct work_struct *work)
 		dev_err(&chip->udev->dev,
 			"USB streaming error: stopping PCM streams\n");
 		for (i = 0; i < 2; i++) {
-			/* substream は open/close とも mutex 下で変わるので安全 */
 			if (chip->stream[i].substream)
 				snd_pcm_stop_xrun(chip->stream[i].substream);
 		}
@@ -680,6 +647,15 @@ static const struct snd_pcm_hw_constraint_list uac8_rate_list_ext = {
 	.count = ARRAY_SIZE(uac8_rates_ext),
 };
 
+/* 32 から 2048 までの 2 の累乗ステップ一覧 */
+static const unsigned int uac8_periods_list[] = {
+	32, 64, 128, 256, 512, 1024, 2048
+};
+static const struct snd_pcm_hw_constraint_list uac8_period_sizes = {
+	.list = uac8_periods_list,
+	.count = ARRAY_SIZE(uac8_periods_list),
+};
+
 static const struct snd_pcm_hardware uac8_pcm_hw = {
 	.info = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID |
 		SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_BLOCK_TRANSFER |
@@ -689,12 +665,11 @@ static const struct snd_pcm_hardware uac8_pcm_hw = {
 	.rate_min = 96000,
 	.rate_max = 96000,
 	.channels_min = 1,
-	.channels_max = UAC8_PLAY_CHANNELS,	/* open で上書き */
+	.channels_max = UAC8_PLAY_CHANNELS,
 	.buffer_bytes_max = UAC8_BUFFER_FRAMES_MAX * UAC8_SAMPLE_BYTES *
 			    UAC8_PHYS_CHANNELS,
-	.period_bytes_min = UAC8_PERIOD_FRAMES_MIN * UAC8_SAMPLE_BYTES,
-	.period_bytes_max = UAC8_PERIOD_FRAMES_MAX * UAC8_SAMPLE_BYTES *
-			    UAC8_PHYS_CHANNELS,
+	.period_bytes_min = 32 * UAC8_SAMPLE_BYTES,
+	.period_bytes_max = 2048 * UAC8_SAMPLE_BYTES * UAC8_PHYS_CHANNELS,
 	.periods_min = UAC8_PERIODS_MIN,
 	.periods_max = UAC8_PERIODS_MAX,
 };
@@ -703,7 +678,6 @@ static void uac8_wait_idle(struct uac8_stream *s)
 {
 	int i;
 
-	/* 実行中の snd_pcm_period_elapsed() が抜けるのを待つ (最大 ~200ms) */
 	for (i = 0; i < 2000 && atomic_read_acquire(&s->notify_busy); i++)
 		usleep_range(50, 100);
 }
@@ -727,8 +701,7 @@ static int uac8_pcm_open(struct snd_pcm_substream *ss)
 	rt->hw.channels_max = s->max_ch;
 	rt->hw.buffer_bytes_max = UAC8_BUFFER_FRAMES_MAX * UAC8_SAMPLE_BYTES *
 				  s->max_ch;
-	rt->hw.period_bytes_max = UAC8_PERIOD_FRAMES_MAX * UAC8_SAMPLE_BYTES *
-				  s->max_ch;
+	rt->hw.period_bytes_max = 2048 * UAC8_SAMPLE_BYTES * s->max_ch;
 	if (ext_rates) {
 		rt->hw.rate_min = 44100;
 		rt->hw.rate_max = 192000;
@@ -739,7 +712,7 @@ static int uac8_pcm_open(struct snd_pcm_substream *ss)
 						     &uac8_rate_list_std);
 	if (err < 0)
 		goto out;
-	/* 反対方向が設定済みなら同じレートに縛る (デバイスのクロックは 1 つ) */
+
 	if (other->hw_rate) {
 		err = snd_pcm_hw_constraint_minmax(rt, SNDRV_PCM_HW_PARAM_RATE,
 						   other->hw_rate,
@@ -747,20 +720,18 @@ static int uac8_pcm_open(struct snd_pcm_substream *ss)
 		if (err < 0)
 			goto out;
 	}
-	/* URB が 8 フレーム単位なので period / buffer も 8 の倍数に揃える */
-	err = snd_pcm_hw_constraint_minmax(rt, SNDRV_PCM_HW_PARAM_PERIOD_SIZE,
-					   UAC8_PERIOD_FRAMES_MIN,
-					   UAC8_PERIOD_FRAMES_MAX);
+
+	/* 32〜2048 のリストを制約として明示 */
+	err = snd_pcm_hw_constraint_list(rt, 0, SNDRV_PCM_HW_PARAM_PERIOD_SIZE,
+					 &uac8_period_sizes);
 	if (err < 0)
 		goto out;
-	err = snd_pcm_hw_constraint_step(rt, 0, SNDRV_PCM_HW_PARAM_PERIOD_SIZE,
-					 UAC8_URB_FRAMES);
-	if (err < 0)
-		goto out;
+
 	err = snd_pcm_hw_constraint_step(rt, 0, SNDRV_PCM_HW_PARAM_BUFFER_SIZE,
 					 UAC8_URB_FRAMES);
 	if (err < 0)
 		goto out;
+
 	err = snd_pcm_hw_constraint_integer(rt, SNDRV_PCM_HW_PARAM_PERIODS);
 	if (err < 0)
 		goto out;
@@ -862,13 +833,13 @@ static int uac8_pcm_prepare(struct snd_pcm_substream *ss)
 		goto out;
 	}
 
-	/* 異常停止後 / レート変更時はエンジンを作り直す */
 	if (chip->engine_running &&
 	    (chip->rate != rt->rate ||
 	     test_bit(UAC8_FLAG_FAILED, &chip->flags)))
 		uac8_stop_engine(chip);
+
 	if (!chip->engine_running) {
-		err = uac8_start_engine(chip, rt->rate);
+		err = uac8_start_engine(chip, rt->rate, rt->period_size);
 		if (err)
 			goto out;
 	}
@@ -885,14 +856,13 @@ static int uac8_pcm_prepare(struct snd_pcm_substream *ss)
 	s->period_pos = 0;
 	spin_unlock_irqrestore(&chip->lock, flags);
 
-	/* 再生は URB 128 本ぶんの先読みがある */
-	rt->delay = s->playback ? UAC8_NUM_URBS * UAC8_URB_FRAMES : 0;
+	/* 再生ディレイを実際に投入された URB 本数に合わせて動的計算 */
+	rt->delay = s->playback ? s->active_urbs * UAC8_URB_FRAMES : 0;
 out:
 	mutex_unlock(&chip->mutex);
 	return err;
 }
 
-/* atomic context。USB には触らず、ハンドラが見るフラグを切り替えるだけ */
 static int uac8_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
 {
 	struct uac8 *chip = snd_pcm_substream_chip(ss);
@@ -971,7 +941,6 @@ uac8_find_bulk_ep(struct usb_interface *iface, int alt, u8 addr)
 	return NULL;
 }
 
-/* 想定と違うファームウェアに誤って bind しないよう、使う Alt の EP を事前検証 */
 static int uac8_check_alts(struct usb_interface *intf,
 			   struct usb_interface *out_if,
 			   struct usb_interface *in_if)
@@ -1001,12 +970,11 @@ static int uac8_claim_companion(struct usb_interface *intf,
 
 	if (cur) {
 		if (to_usb_driver(cur) == &uac8_driver) {
-			/* 以前の bind の claim が残っているだけ */
 			usb_set_intfdata(iface, UAC8_COMPANION);
 			return 0;
 		}
 		dev_err(&intf->dev,
-			"interface %d is bound to '%s'; disable snd-usb-audio for this device (see README)\n",
+			"interface %d is bound to '%s'; disable snd-usb-audio for this device\n",
 			iface->cur_altsetting->desc.bInterfaceNumber,
 			cur->name);
 		return -EBUSY;
@@ -1033,7 +1001,6 @@ static int uac8_probe(struct usb_interface *intf,
 	char path[64];
 	int err;
 
-	/* AudioControl IF だけが入口。他の IF (MIDI 等) は触らない */
 	if (intf->cur_altsetting->desc.bInterfaceNumber != UAC8_IF_CTRL)
 		return -ENODEV;
 
@@ -1098,9 +1065,8 @@ static int uac8_probe(struct usb_interface *intf,
 		goto err_free;
 	}
 
-	dev_info(&intf->dev, "ZOOM UAC-8 ready: playback %dch / capture %dch, %s\n",
-		 UAC8_PLAY_CHANNELS, UAC8_CAP_CHANNELS,
-		 ext_rates ? "44.1-192 kHz (ext_rates)" : "96 kHz");
+	dev_info(&intf->dev, "ZOOM UAC-8 ready: playback %dch / capture %dch (32-2048 frames supported)\n",
+		 UAC8_PLAY_CHANNELS, UAC8_CAP_CHANNELS);
 	return 0;
 
 err_free:
@@ -1119,10 +1085,9 @@ static void uac8_disconnect(struct usb_interface *intf)
 	snd_card_disconnect(chip->card);
 
 	mutex_lock(&chip->mutex);
-	uac8_stop_engine(chip);		/* 全 URB を kill して解放 */
+	uac8_stop_engine(chip);
 	mutex_unlock(&chip->mutex);
 
-	/* work は mutex を取るので、mutex を持たずに待つ */
 	cancel_work_sync(&chip->fail_work);
 
 	usb_set_intfdata(intf, NULL);
@@ -1145,7 +1110,6 @@ static int uac8_suspend(struct usb_interface *intf, pm_message_t message)
 	return 0;
 }
 
-/* 再開は SNDRV_PCM_INFO_RESUME を出していないので、アプリが prepare し直す */
 static int uac8_resume(struct usb_interface *intf)
 {
 	struct uac8 *chip = usb_get_intfdata(intf);
