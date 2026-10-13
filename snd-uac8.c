@@ -2,6 +2,7 @@
 /*
  * snd-uac8 - ALSA USB オーディオドライバ (ZOOM UAC-8, USB 1686:f02b)
  *
+ * 44.1 / 48 / 88.2 / 96 / 176.4 / 192 kHz サンプリングレート切り替え対応
  * 32, 64, 128, 256, 512, 1024, 2048 サンプル/周期 (frames/period) 完全対応版
  */
 
@@ -25,7 +26,7 @@ MODULE_DESCRIPTION("ALSA driver for ZOOM UAC-8 (1686:f02b)");
 MODULE_LICENSE("GPL");
 
 /* ------------------------------------------------------------------ */
-/* デバイス定数                                                        */
+/* デバイス定数                                                       */
 /* ------------------------------------------------------------------ */
 #define UAC8_VENDOR_ID		0x1686
 #define UAC8_PRODUCT_ID		0xf02b
@@ -62,22 +63,18 @@ static_assert(UAC8_PLAY_CHANNELS <= UAC8_PHYS_CHANNELS);
 static_assert(UAC8_CAP_CHANNELS <= UAC8_PHYS_CHANNELS);
 
 /* ------------------------------------------------------------------ */
-/* モジュールパラメータ                                                */
+/* モジュールパラメータ                                               */
 /* ------------------------------------------------------------------ */
 static int card_index = SNDRV_DEFAULT_IDX1;
 static char *card_id = SNDRV_DEFAULT_STR1;
-static bool ext_rates;
 
 module_param_named(index, card_index, int, 0444);
 MODULE_PARM_DESC(index, "Index value for the UAC-8 sound card.");
 module_param_named(id, card_id, charp, 0444);
 MODULE_PARM_DESC(id, "ID string for the UAC-8 sound card.");
-module_param(ext_rates, bool, 0444);
-MODULE_PARM_DESC(ext_rates,
-		 "Also offer 44.1/48/88.2/176.4/192 kHz (UNTESTED; default: 96 kHz only).");
 
 /* ------------------------------------------------------------------ */
-/* 構造体                                                              */
+/* 構造体                                                             */
 /* ------------------------------------------------------------------ */
 struct uac8;
 struct uac8_stream;
@@ -144,7 +141,7 @@ static inline struct uac8_stream *uac8_stream_of(struct uac8 *chip,
 }
 
 /* ------------------------------------------------------------------ */
-/* ハードウェア制御                                                    */
+/* ハードウェア制御                                                   */
 /* ------------------------------------------------------------------ */
 static int uac8_rate_to_alt(unsigned int rate)
 {
@@ -529,11 +526,6 @@ static void uac8_stop_engine(struct uac8 *chip)
 /*
  * 周期サイズ (period_size) に応じて投入する URB 本数を動的に決定する。
  * 1 URB = 8 フレーム。
- * 例:
- *   32  フレーム -> 8 URB  (64 フレーム分先行, ~0.67ms)
- *   64  フレーム -> 16 URB (128 フレーム分先行)
- *   128 フレーム -> 32 URB (256 フレーム分先行)
- *   256 フレーム以上 -> 64〜128 URB
  */
 static unsigned int uac8_calc_urbs(unsigned int period_size)
 {
@@ -634,17 +626,12 @@ static void uac8_fail_work(struct work_struct *work)
 /* ------------------------------------------------------------------ */
 /* PCM                                                                */
 /* ------------------------------------------------------------------ */
-static const unsigned int uac8_rates_std[] = { 96000 };
-static const unsigned int uac8_rates_ext[] = {
+static const unsigned int uac8_rates[] = {
 	44100, 48000, 88200, 96000, 176400, 192000
 };
-static const struct snd_pcm_hw_constraint_list uac8_rate_list_std = {
-	.list = uac8_rates_std,
-	.count = ARRAY_SIZE(uac8_rates_std),
-};
-static const struct snd_pcm_hw_constraint_list uac8_rate_list_ext = {
-	.list = uac8_rates_ext,
-	.count = ARRAY_SIZE(uac8_rates_ext),
+static const struct snd_pcm_hw_constraint_list uac8_rate_list = {
+	.list = uac8_rates,
+	.count = ARRAY_SIZE(uac8_rates),
 };
 
 /* 32 から 2048 までの 2 の累乗ステップ一覧 */
@@ -662,8 +649,8 @@ static const struct snd_pcm_hardware uac8_pcm_hw = {
 		SNDRV_PCM_INFO_BATCH | SNDRV_PCM_INFO_JOINT_DUPLEX,
 	.formats = SNDRV_PCM_FMTBIT_S32_LE,
 	.rates = SNDRV_PCM_RATE_KNOT,
-	.rate_min = 96000,
-	.rate_max = 96000,
+	.rate_min = 44100,
+	.rate_max = 192000,
 	.channels_min = 1,
 	.channels_max = UAC8_PLAY_CHANNELS,
 	.buffer_bytes_max = UAC8_BUFFER_FRAMES_MAX * UAC8_SAMPLE_BYTES *
@@ -702,14 +689,9 @@ static int uac8_pcm_open(struct snd_pcm_substream *ss)
 	rt->hw.buffer_bytes_max = UAC8_BUFFER_FRAMES_MAX * UAC8_SAMPLE_BYTES *
 				  s->max_ch;
 	rt->hw.period_bytes_max = 2048 * UAC8_SAMPLE_BYTES * s->max_ch;
-	if (ext_rates) {
-		rt->hw.rate_min = 44100;
-		rt->hw.rate_max = 192000;
-	}
 
 	err = snd_pcm_hw_constraint_list(rt, 0, SNDRV_PCM_HW_PARAM_RATE,
-					 ext_rates ? &uac8_rate_list_ext :
-						     &uac8_rate_list_std);
+					 &uac8_rate_list);
 	if (err < 0)
 		goto out;
 
@@ -922,7 +904,7 @@ static const struct snd_pcm_ops uac8_pcm_ops = {
 };
 
 /* ------------------------------------------------------------------ */
-/* USB ドライバ                                                        */
+/* USB ドライバ                                                       */
 /* ------------------------------------------------------------------ */
 static const struct usb_endpoint_descriptor *
 uac8_find_bulk_ep(struct usb_interface *iface, int alt, u8 addr)
@@ -945,18 +927,15 @@ static int uac8_check_alts(struct usb_interface *intf,
 			   struct usb_interface *out_if,
 			   struct usb_interface *in_if)
 {
-	static const int std_alts[] = { 2 };
-	static const int ext_alts[] = { 1, 2, 3 };
-	const int *alts = ext_rates ? ext_alts : std_alts;
-	int n = ext_rates ? ARRAY_SIZE(ext_alts) : ARRAY_SIZE(std_alts);
+	static const int required_alts[] = { 1, 2, 3 };
 	int i;
 
-	for (i = 0; i < n; i++) {
-		if (!uac8_find_bulk_ep(out_if, alts[i], UAC8_EP_OUT) ||
-		    !uac8_find_bulk_ep(in_if, alts[i], UAC8_EP_IN)) {
+	for (i = 0; i < ARRAY_SIZE(required_alts); i++) {
+		if (!uac8_find_bulk_ep(out_if, required_alts[i], UAC8_EP_OUT) ||
+		    !uac8_find_bulk_ep(in_if, required_alts[i], UAC8_EP_IN)) {
 			dev_err(&intf->dev,
 				"alt %d: bulk EP 0x%02x/0x%02x not found, unsupported firmware?\n",
-				alts[i], UAC8_EP_OUT, UAC8_EP_IN);
+				required_alts[i], UAC8_EP_OUT, UAC8_EP_IN);
 			return -ENODEV;
 		}
 	}
@@ -1065,7 +1044,7 @@ static int uac8_probe(struct usb_interface *intf,
 		goto err_free;
 	}
 
-	dev_info(&intf->dev, "ZOOM UAC-8 ready: playback %dch / capture %dch (32-2048 frames supported)\n",
+	dev_info(&intf->dev, "ZOOM UAC-8 ready: playback %dch / capture %dch (44.1k-192k, 32-2048 frames supported)\n",
 		 UAC8_PLAY_CHANNELS, UAC8_CAP_CHANNELS);
 	return 0;
 
