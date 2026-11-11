@@ -1,4 +1,3 @@
-![QjackCtl Screenshot](Screenshot%20from%202026-11-12%2002-50-51.png)
 # snd-uac8 (Experimental)
 
 ## ⚠️ Looking for Maintainers / Help Upstreaming
