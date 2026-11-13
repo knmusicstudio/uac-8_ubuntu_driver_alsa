@@ -1,9 +1,9 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-only
 set -e
 
-# ルート権限チェック
 if [ "$EUID" -ne 0 ]; then
-  echo "エラー: sudo を付けて実行してください (例: sudo ./install.sh)"
+  echo "Error: Please run with sudo (e.g., sudo ./install.sh)"
   exit 1
 fi
 
@@ -20,34 +20,32 @@ manage_wireplumber() {
   fi
 }
 
-echo "===> [1/5] WirePlumber を一時停止中..."
+echo "===> [1/5] Stopping WirePlumber..."
 manage_wireplumber stop
 
-echo "===> [2/5] snd-uac8 をビルド中..."
+echo "===> [2/5] Building snd-uac8..."
 make clean
 make
 
-echo "===> [3/5] モジュールを ${INSTALL_DIR} に配置中..."
+echo "===> [3/5] Installing module to ${INSTALL_DIR}..."
 mkdir -p "${INSTALL_DIR}"
 cp snd-uac8.ko "${INSTALL_DIR}/"
 
-echo "===> [4/5] モジュールの依存関係を更新中 (depmod)..."
+echo "===> [4/5] Updating module dependencies (depmod)..."
 depmod -a
 
-echo "===> [5/5] 自動ロード設定 (/etc/modules-load.d/snd-uac8.conf) を作成中..."
+echo "===> [5/5] Configuring module autoload (/etc/modules-load.d/snd-uac8.conf)..."
 echo "snd-uac8" > /etc/modules-load.d/snd-uac8.conf
 
-echo "===> ドライバを即時ロード中..."
-if lsmod | grep -q "^snd_uac8"; then
-  rmmod snd-uac8 || true
-fi
+echo "===> Reloading driver..."
+modprobe -r snd-uac8 2>/dev/null || true
 modprobe snd-uac8
 
-echo "===> WirePlumber を再開中..."
+echo "===> Restarting WirePlumber..."
 manage_wireplumber start
 
 echo "----------------------------------------"
-echo "インストール完了！"
-echo "カードの認識状態:"
-cat /proc/asound/cards | grep -i uac || true
+echo "Installation complete!"
+echo "Detected sound cards:"
+grep -i uac /proc/asound/cards || true
 echo "----------------------------------------"
