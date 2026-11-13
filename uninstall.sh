@@ -1,9 +1,9 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-only
 set -e
 
-# ルート権限チェック
 if [ "$EUID" -ne 0 ]; then
-  echo "エラー: sudo を付けて実行してください (例: sudo ./uninstall.sh)"
+  echo "Error: Please run with sudo (e.g., sudo ./uninstall.sh)"
   exit 1
 fi
 
@@ -19,32 +19,32 @@ manage_wireplumber() {
   fi
 }
 
-echo "===> [1/4] WirePlumber を一時停止中..."
+echo "===> [1/4] Stopping WirePlumber..."
 manage_wireplumber stop
 
-echo "===> [2/4] モジュールをアンロード中..."
+echo "===> [2/4] Unloading module..."
 if lsmod | grep -q "^snd_uac8"; then
   rmmod snd-uac8 || {
-    echo "警告: モジュールが使用中です。JACK や DAW を終了してから再実行してください。"
+    echo "Warning: Module is currently in use. Please close JACK or your DAW and try again."
     manage_wireplumber start
     exit 1
   }
 fi
 
-echo "===> [3/4] インストール済みファイルと自動設定を削除中..."
+echo "===> [3/4] Removing installed files and autoload configuration..."
 rm -f "/lib/modules/${KVER}/extra/snd-uac8.ko"
 rm -f "/lib/modules/${KVER}/kernel/drivers/sound/snd-uac8.ko"
 rm -f /etc/modules-load.d/snd-uac8.conf
 
-echo "===> [4/4] モジュールの依存関係を更新中 (depmod)..."
+echo "===> [4/4] Updating module dependencies (depmod)..."
 depmod -a
 
-echo "===> ビルド生成物をクリーンアップ中..."
+echo "===> Cleaning build artifacts..."
 make clean >/dev/null 2>&1 || true
 
-echo "===> WirePlumber を再開中..."
+echo "===> Restarting WirePlumber..."
 manage_wireplumber start
 
 echo "----------------------------------------"
-echo "アンインストール完了！"
+echo "Uninstallation complete!"
 echo "----------------------------------------"
