@@ -1,33 +1,27 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0-only
 /*
- * snd-uac8 - ALSA USB オーディオドライバ (ZOOM UAC-8, USB 1686:f02b)
- *
- * 44.1 / 48 / 88.2 / 96 / 176.4 / 192 kHz サンプリングレート切り替え対応
- * 32, 64, 128, 256, 512, 1024, 2048 サンプル/周期 (frames/period) 完全対応版
+ * ALSA USB audio driver for ZOOM UAC-8 (1686:f02b)
  */
 
-#include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/slab.h>
-#include <linux/usb.h>
-#include <linux/delay.h>
-#include <linux/mutex.h>
-#include <linux/spinlock.h>
-#include <linux/workqueue.h>
 #include <linux/atomic.h>
 #include <linux/bitops.h>
+#include <linux/delay.h>
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/slab.h>
+#include <linux/spinlock.h>
+#include <linux/usb.h>
+#include <linux/workqueue.h>
 #include <sound/core.h>
 #include <sound/initval.h>
 #include <sound/pcm.h>
 #include <sound/pcm_params.h>
 
-MODULE_AUTHOR("converted from main.c");
+MODULE_AUTHOR("Wataru Matsui (knmusicstudio)");
 MODULE_DESCRIPTION("ALSA driver for ZOOM UAC-8 (1686:f02b)");
-MODULE_LICENSE("GPL");
+MODULE_LICENSE("GPL v2");
 
-/* ------------------------------------------------------------------ */
-/* デバイス定数                                                       */
-/* ------------------------------------------------------------------ */
 #define UAC8_VENDOR_ID		0x1686
 #define UAC8_PRODUCT_ID		0xf02b
 
@@ -40,10 +34,10 @@ MODULE_LICENSE("GPL");
 
 #define UAC8_PHYS_CHANNELS	32
 #define UAC8_SAMPLE_BYTES	4	/* S32_LE */
-#define UAC8_FRAME_BYTES	(UAC8_PHYS_CHANNELS * UAC8_SAMPLE_BYTES)	/* 128 */
+#define UAC8_FRAME_BYTES	(UAC8_PHYS_CHANNELS * UAC8_SAMPLE_BYTES)
 
 #define UAC8_URB_BYTES		1024
-#define UAC8_URB_FRAMES		(UAC8_URB_BYTES / UAC8_FRAME_BYTES)	/* 8 */
+#define UAC8_URB_FRAMES		(UAC8_URB_BYTES / UAC8_FRAME_BYTES)
 #define UAC8_MAX_URBS		128
 
 #define UAC8_PLAY_CHANNELS	20
@@ -62,9 +56,6 @@ static_assert(UAC8_URB_BYTES % UAC8_FRAME_BYTES == 0);
 static_assert(UAC8_PLAY_CHANNELS <= UAC8_PHYS_CHANNELS);
 static_assert(UAC8_CAP_CHANNELS <= UAC8_PHYS_CHANNELS);
 
-/* ------------------------------------------------------------------ */
-/* モジュールパラメータ                                               */
-/* ------------------------------------------------------------------ */
 static int card_index = SNDRV_DEFAULT_IDX1;
 static char *card_id = SNDRV_DEFAULT_STR1;
 
@@ -73,9 +64,6 @@ MODULE_PARM_DESC(index, "Index value for the UAC-8 sound card.");
 module_param_named(id, card_id, charp, 0444);
 MODULE_PARM_DESC(id, "ID string for the UAC-8 sound card.");
 
-/* ------------------------------------------------------------------ */
-/* 構造体                                                             */
-/* ------------------------------------------------------------------ */
 struct uac8;
 struct uac8_stream;
 
@@ -89,10 +77,10 @@ struct uac8_stream {
 	struct uac8 *chip;
 	bool playback;
 	unsigned int max_ch;
-	unsigned int active_urbs;	/* 周期サイズに応じて動的計算 */
+	unsigned int active_urbs;
 	struct uac8_urb_ctx ctx[UAC8_MAX_URBS];
 
-	/* chip->lock で保護 */
+	/* Protected by chip->lock */
 	struct snd_pcm_substream *substream;
 	bool running;
 	unsigned int ch;
@@ -101,7 +89,7 @@ struct uac8_stream {
 	unsigned int buffer_size;
 	unsigned int period_size;
 
-	/* chip->mutex で保護 */
+	/* Protected by chip->mutex */
 	unsigned int hw_rate;
 
 	atomic_t notify_busy;
@@ -140,9 +128,6 @@ static inline struct uac8_stream *uac8_stream_of(struct uac8 *chip,
 	return &chip->stream[ss->stream];
 }
 
-/* ------------------------------------------------------------------ */
-/* ハードウェア制御                                                   */
-/* ------------------------------------------------------------------ */
 static int uac8_rate_to_alt(unsigned int rate)
 {
 	if (rate >= 176400)
@@ -156,15 +141,11 @@ static int uac8_ctrl_out(struct uac8 *chip, u8 reqtype, u8 req, u16 value,
 			 u16 index, const void *data, u16 len)
 {
 	struct usb_device *udev = chip->udev;
-	void *buf;
+	void *buf = NULL;
 	int ret;
 
 	if (len) {
 		buf = kmemdup(data, len, GFP_KERNEL);
-		if (!buf)
-			return -ENOMEM;
-	} else {
-		buf = kmalloc(1, GFP_KERNEL);
 		if (!buf)
 			return -ENOMEM;
 	}
@@ -185,6 +166,7 @@ static bool uac8_dev_gone(struct uac8 *chip)
 	       chip->udev->state == USB_STATE_NOTATTACHED;
 }
 
+/* Vendor-specific clock and interface initialization sequence */
 static int uac8_configure_hw(struct uac8 *chip, unsigned int rate, int alt)
 {
 	struct usb_device *udev = chip->udev;
@@ -236,9 +218,6 @@ err_if:
 	return err;
 }
 
-/* ------------------------------------------------------------------ */
-/* URB / ストリーミング                                               */
-/* ------------------------------------------------------------------ */
 static void uac8_fail(struct uac8 *chip)
 {
 	if (!test_and_set_bit(UAC8_FLAG_FAILED, &chip->flags))
@@ -254,7 +233,8 @@ static bool uac8_stream_active(const struct uac8_stream *s)
 	rt = s->substream->runtime;
 	if (!rt || !rt->dma_area)
 		return false;
-	if (!s->ch || s->ch > s->max_ch || s->ch * UAC8_SAMPLE_BYTES > UAC8_FRAME_BYTES)
+	if (!s->ch || s->ch > s->max_ch ||
+	    s->ch * UAC8_SAMPLE_BYTES > UAC8_FRAME_BYTES)
 		return false;
 	if (!s->buffer_size || !s->period_size)
 		return false;
@@ -523,26 +503,14 @@ static void uac8_stop_engine(struct uac8 *chip)
 	}
 }
 
-/*
- * 周期サイズ (period_size) に応じて投入する URB 本数を動的に決定する。
- * 1 URB = 8 フレーム。
- */
+/* Scale in-flight URB count with period size (1 URB = 8 frames) */
 static unsigned int uac8_calc_urbs(unsigned int period_size)
 {
-	unsigned int urbs;
+	unsigned int urbs = period_size / 4;
 
-	if (period_size <= 32)
-		urbs = 8;
-	else if (period_size <= 64)
-		urbs = 16;
-	else if (period_size <= 128)
-		urbs = 32;
-	else if (period_size <= 512)
+	if (period_size == 512)
 		urbs = 64;
-	else
-		urbs = UAC8_MAX_URBS;
-
-	return clamp_val(urbs, 8U, (unsigned int)UAC8_MAX_URBS);
+	return clamp(urbs, 8U, (unsigned int)UAC8_MAX_URBS);
 }
 
 static int uac8_start_engine(struct uac8 *chip, unsigned int rate,
@@ -596,8 +564,10 @@ static int uac8_start_engine(struct uac8 *chip, unsigned int rate,
 		goto err_stop;
 
 	chip->engine_running = true;
-	dev_info(&udev->dev, "streaming started: %u Hz, alt %d, queue %u URBs (%u frames ahead)\n",
-		 rate, uac8_rate_to_alt(rate), num_urbs, num_urbs * UAC8_URB_FRAMES);
+	dev_info(&udev->dev,
+		 "streaming started: %u Hz, alt %d, queue %u URBs (%u frames ahead)\n",
+		 rate, uac8_rate_to_alt(rate), num_urbs,
+		 num_urbs * UAC8_URB_FRAMES);
 	return 0;
 
 err_stop:
@@ -623,9 +593,6 @@ static void uac8_fail_work(struct work_struct *work)
 	mutex_unlock(&chip->mutex);
 }
 
-/* ------------------------------------------------------------------ */
-/* PCM                                                                */
-/* ------------------------------------------------------------------ */
 static const unsigned int uac8_rates[] = {
 	44100, 48000, 88200, 96000, 176400, 192000
 };
@@ -634,7 +601,6 @@ static const struct snd_pcm_hw_constraint_list uac8_rate_list = {
 	.count = ARRAY_SIZE(uac8_rates),
 };
 
-/* 32 から 2048 までの 2 の累乗ステップ一覧 */
 static const unsigned int uac8_periods_list[] = {
 	32, 64, 128, 256, 512, 1024, 2048
 };
@@ -703,7 +669,6 @@ static int uac8_pcm_open(struct snd_pcm_substream *ss)
 			goto out;
 	}
 
-	/* 32〜2048 のリストを制約として明示 */
 	err = snd_pcm_hw_constraint_list(rt, 0, SNDRV_PCM_HW_PARAM_PERIOD_SIZE,
 					 &uac8_period_sizes);
 	if (err < 0)
@@ -838,7 +803,6 @@ static int uac8_pcm_prepare(struct snd_pcm_substream *ss)
 	s->period_pos = 0;
 	spin_unlock_irqrestore(&chip->lock, flags);
 
-	/* 再生ディレイを実際に投入された URB 本数に合わせて動的計算 */
 	rt->delay = s->playback ? s->active_urbs * UAC8_URB_FRAMES : 0;
 out:
 	mutex_unlock(&chip->mutex);
@@ -850,7 +814,6 @@ static int uac8_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
 	struct uac8 *chip = snd_pcm_substream_chip(ss);
 	struct uac8_stream *s = uac8_stream_of(chip, ss);
 	unsigned long flags;
-	int err = 0;
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
@@ -870,10 +833,9 @@ static int uac8_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
 		spin_unlock_irqrestore(&chip->lock, flags);
 		break;
 	default:
-		err = -EINVAL;
-		break;
+		return -EINVAL;
 	}
-	return err;
+	return 0;
 }
 
 static snd_pcm_uframes_t uac8_pcm_pointer(struct snd_pcm_substream *ss)
@@ -903,9 +865,6 @@ static const struct snd_pcm_ops uac8_pcm_ops = {
 	.pointer	= uac8_pcm_pointer,
 };
 
-/* ------------------------------------------------------------------ */
-/* USB ドライバ                                                       */
-/* ------------------------------------------------------------------ */
 static const struct usb_endpoint_descriptor *
 uac8_find_bulk_ep(struct usb_interface *iface, int alt, u8 addr)
 {
@@ -1044,7 +1003,8 @@ static int uac8_probe(struct usb_interface *intf,
 		goto err_free;
 	}
 
-	dev_info(&intf->dev, "ZOOM UAC-8 ready: playback %dch / capture %dch (44.1k-192k, 32-2048 frames supported)\n",
+	dev_info(&intf->dev,
+		 "ZOOM UAC-8 ready: playback %dch / capture %dch (44.1k-192k, 32-2048 frames)\n",
 		 UAC8_PLAY_CHANNELS, UAC8_CAP_CHANNELS);
 	return 0;
 
